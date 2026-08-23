@@ -24,6 +24,7 @@ LABEL="cc.openq.lidawake"
 STATE="$HOME/.local/state/lidawake"; mkdir -p "$STATE"
 MODEF="$STATE/mode"; THRF="$STATE/threshold"; LOG="$STATE/lidawake.log"
 BLANKF="$STATE/blank_on_shut"; SAVEB="$STATE/saved_brightness"; LOCKF="$STATE/lock_on_shut"
+FLOORF="$STATE/hard_floor"; CALF="$STATE/calibration.txt"
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 POLL=10
@@ -35,7 +36,12 @@ BRIGHT="$(dirname "$SELF")/dispbright"
 [ -f "$MODEF" ]  || echo auto > "$MODEF"
 [ -f "$BLANKF" ] || echo 1    > "$BLANKF"
 [ -f "$LOCKF" ]  || echo 1    > "$LOCKF"
-thr(){ cat "$THRF" 2>/dev/null || echo 20; }
+# Conservative default until `lidawake calibrate` measures this machine.
+[ -f "$FLOORF" ] || echo 5    > "$FLOORF"
+floor(){ cat "$FLOORF" 2>/dev/null || echo 5; }
+# User reserve, never allowed below the measured hard floor.
+thr(){ local u f; u=$(cat "$THRF" 2>/dev/null || echo 20); f=$(floor)
+       [ "$u" -lt "$f" ] && echo "$f" || echo "$u"; }
 mode(){ cat "$MODEF" 2>/dev/null || echo auto; }
 blank_on(){ cat "$BLANKF" 2>/dev/null || echo 1; }
 lock_on(){ cat "$LOCKF" 2>/dev/null || echo 1; }
@@ -113,6 +119,137 @@ _daemon(){
   done
 }
 
+# ── Measure this machine and derive its hard floor ──────────────────────────
+# The floor answers one question only: below what charge is there no longer
+# enough runway to release the hold and complete a safe sleep before the
+# battery is empty? Everything above that is user preference, not safety.
+_bstat(){  # -> "maxmAh curmAh amperage_mA voltage_mV designmAh"
+  ioreg -rc AppleSmartBattery 2>/dev/null | /usr/bin/python3 -c '
+import sys
+t = sys.stdin.read()
+def g(k):
+    for line in t.splitlines():
+        if "\"" + k + "\"" in line and "=" in line:
+            v = line.split("=")[-1].strip()
+            if v.lstrip("-").isdigit(): return int(v)
+    return 0
+def sgn(v): return v - 2**64 if v > 2**63 else v
+print(g("AppleRawMaxCapacity"), g("AppleRawCurrentCapacity"),
+      sgn(g("InstantAmperage")), g("Voltage"), g("DesignCapacity"))'
+}
+
+_calibrate(){
+  command -v /usr/bin/python3 >/dev/null || { echo "python3 required" >&2; return 1; }
+  if on_ac; then
+    echo "Unplug the power adapter first — discharge rate cannot be measured on AC."
+    return 1
+  fi
+  local mx cur amp volt des
+  read -r mx cur amp volt des <<<"$(_bstat)"
+  [ "${mx:-0}" -gt 0 ] || { echo "could not read battery telemetry" >&2; return 1; }
+
+  echo "Calibrating this machine. Takes about 30 seconds, fans/CPU will spin up."
+  echo
+  printf 'Battery   : %s mAh full (design %s mAh, health %s%%), %s mV\n' \
+    "$mx" "$des" "$(( mx * 100 / (des>0?des:1) ))" "$volt"
+
+  # --- worst-case draw: load every core, sample, keep the largest ---
+  local n pids=() i a peak=0
+  n=$(sysctl -n hw.ncpu)
+  for i in $(seq 1 "$n"); do yes > /dev/null & pids+=($!); done
+  sleep 8
+  for i in 1 2 3 4 5 6; do
+    read -r _ _ a _ _ <<<"$(_bstat)"
+    a=${a#-}; [ "${a:-0}" -gt "$peak" ] && peak=$a
+    sleep 2
+  done
+  kill "${pids[@]}" 2>/dev/null; wait "${pids[@]}" 2>/dev/null
+  # A safety floor may only ratchet up. Draw depends on what else happened to
+  # be running, so a quieter re-run must not erase a worse case we already saw.
+  local prevpeak=0 note=""
+  [ -f "$STATE/peak_ma" ] && prevpeak=$(cat "$STATE/peak_ma" 2>/dev/null || echo 0)
+  if [ "$prevpeak" -gt "$peak" ]; then
+    note="  (keeping earlier worse case; this run measured ${peak} mA)"; peak=$prevpeak
+  else
+    echo "$peak" > "$STATE/peak_ma"
+  fi
+  printf 'Peak draw : %s mA on %s cores = %s W%s\n' "$peak" "$n" \
+    "$(/usr/bin/python3 -c "print(round($peak*$volt/1e6,1))")" "$note"
+
+  # --- how long a safe sleep takes: hibernate image / disk throughput ---
+  local img spd
+  img=$(stat -f%z /var/vm/sleepimage 2>/dev/null || echo 0)
+  spd=$(dd if=/dev/zero of=/tmp/.lidawake_spd bs=1m count=256 2>&1 | awk -F'[( ]' '/bytes/{print $(NF-1)}')
+  rm -f /tmp/.lidawake_spd
+  [ "${spd:-0}" -gt 0 ] || spd=500000000
+  printf 'Sleep img : %s MB, disk %s MB/s\n' "$((img/1048576))" "$((spd/1048576))"
+
+  # --- derive ---
+  local out
+  out=$(/usr/bin/python3 - "$peak" "$mx" "$img" "$spd" "$POLL" <<'PY'
+import sys, math
+peak, mx, img, spd, poll = (int(float(x)) for x in sys.argv[1:6])
+rate = peak / mx * 100 / 60            # %/min at peak draw
+t_write = (img / spd) * 2 if img else 10   # 2x margin: hibernate write is not pure sequential
+t_total = poll + t_write + 5           # detect + write + fixed overhead
+need = t_total / 60 * rate             # % consumed while shutting down
+SAFETY = 3                             # discharge-rate uncertainty under bursty load
+# The arithmetic above models discharge rate and shutdown time only. It does
+# NOT model state-of-charge gauge error, which is largest near empty and can
+# be several points on an aged cell — a reported 2% may really be 0%. The 5%
+# lower clamp encodes that; it is not derived, and it is deliberately the
+# binding constraint on healthy machines.
+GAUGE_CLAMP = 5
+floor = max(GAUGE_CLAMP, min(15, math.ceil(need * SAFETY)))
+print(f"{rate:.2f} {t_write:.1f} {t_total:.1f} {need:.2f} {SAFETY} {floor} {math.ceil(need*SAFETY)}")
+PY
+)
+  local rate twrite ttotal need safety newfloor derived
+  read -r rate twrite ttotal need safety newfloor derived <<<"$out"
+
+  echo
+  echo "Derivation"
+  printf '  discharge at peak load     %s %%/min\n' "$rate"
+  printf '  detect (poll interval)     %s s\n' "$POLL"
+  printf '  write hibernate image      %s s  (2x margin)\n' "$twrite"
+  printf '  + fixed overhead           5 s\n'
+  printf '  --------------------------------\n'
+  printf '  time to sleep safely       %s s\n' "$ttotal"
+  printf '  charge consumed in that    %s %%\n' "$need"
+  printf '  x safety factor            %s\n' "$safety"
+  printf '  --------------------------------\n'
+  printf '  derived from discharge     %s %%\n' "$derived"
+  printf '  gauge-error clamp          5 %% (not derived — see note)\n'
+  printf '  ================================\n'
+  printf '  HARD FLOOR                 %s %%\n' "$newfloor"
+
+  echo "$newfloor" > "$FLOORF"
+  { date '+calibrated %Y-%m-%d %H:%M'
+    printf 'battery %s/%s mAh (%s%%), %s mV\n' "$mx" "$des" "$(( mx*100/(des>0?des:1) ))" "$volt"
+    printf 'peak draw %s mA, discharge %s %%/min\n' "$peak" "$rate"
+    printf 'sleep image %s MB, disk %s MB/s, write %s s\n' "$((img/1048576))" "$((spd/1048576))" "$twrite"
+    printf 'time to sleep safely %s s, consumes %s %%, safety x%s\n' "$ttotal" "$need" "$safety"
+    printf 'hard floor %s%%\n' "$newfloor"
+  } > "$CALF"
+
+  local u; u=$(cat "$THRF" 2>/dev/null || echo 20)
+  echo
+  if [ "$u" -lt "$newfloor" ]; then
+    echo "Your reserve ($u%) is below the new floor — raising it to ${newfloor}%."
+    echo "$newfloor" > "$THRF"
+  elif [ "$u" -eq "$newfloor" ]; then
+    printf 'Your reserve (%s%%) sits exactly on the floor.\n' "$u"
+    echo "  Safety-wise that is fine. But it also means you arrive with a flat"
+    echo "  battery, and repeated deep discharge shortens cell life. Raising the"
+    echo "  reserve costs you runway; that trade is yours: lidawake threshold N"
+  else
+    printf 'Your reserve stays at %s%%; the floor is %s%%.\n' "$u" "$newfloor"
+    printf '  Safety only needs %s%%. The other %s points buy charge left on arrival\n' "$newfloor" "$((u-newfloor))"
+    echo "  and keep the cell out of deep discharge — a longevity question, not a safety one."
+  fi
+  echo "Saved to $CALF"
+}
+
 daemon_running(){ case "$(launchctl list 2>/dev/null)" in *"$LABEL"*) return 0;; *) return 1;; esac; }
 
 install_daemon(){
@@ -163,12 +300,24 @@ case "${1:-status}" in
       *)   echo "Dim backlight on lid close: $([ "$(blank_on)" = 1 ] && echo ON || echo OFF)   (lidawake blank on|off)" ;;
     esac ;;
   threshold)
-    [ -n "${2:-}" ] && { echo "$2" > "$THRF"; echo "Battery threshold set to $2%"; } || echo "Battery threshold: $(thr)%" ;;
+    if [ -n "${2:-}" ]; then
+      f=$(floor)
+      if [ "$2" -lt "$f" ]; then
+        echo "Refused: $2% is below this machine's measured hard floor of ${f}%."
+        echo "Below the floor there may not be enough runway to sleep safely before the"
+        echo "battery is empty. Re-measure with: lidawake calibrate"
+        exit 1
+      fi
+      echo "$2" > "$THRF"; echo "Reserve set to $2%  (hard floor ${f}%)"
+    else
+      echo "Reserve: $(cat "$THRF" 2>/dev/null || echo 20)%   hard floor: $(floor)%   effective: $(thr)%"
+    fi ;;
+  calibrate) _calibrate ;;
   status|st)
     m=$(mode)
     printf 'State   : %s\n' "$(is_on && echo 'holding — lid close keeps running' || echo 'not holding — lid close sleeps')"
     case "$m" in
-      auto)   desc="Keep Running — hold on AC, or on battery >= $(thr)%" ;;
+      auto)   desc="Keep Running — hold on AC, or on battery >= $(thr)% (reserve $(cat "$THRF" 2>/dev/null||echo 20)%, floor $(floor)%)" ;;
       paused) desc="Let It Sleep — stock macOS behaviour" ;;
       forced) desc="Keep Running (forced) — hold regardless of battery" ;;
       *)      desc="$m" ;;
@@ -201,6 +350,7 @@ lidawake — keep your MacBook working with the lid closed
   lidawake blank on|off  dim the backlight on lid close (default on)
   lidawake lock  on|off  lock the screen on lid close (default on)
   lidawake run -- CMD    hold only while CMD runs, then restore
+  lidawake calibrate     measure this machine and derive its hard floor
 EOF
   ;;
 esac

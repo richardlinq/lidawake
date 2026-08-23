@@ -72,7 +72,8 @@ lidawake toggle          # flip between the two modes
 lidawake auto            # Keep Running
 lidawake normal          # Let It Sleep (stock behaviour)
 
-lidawake threshold 25    # change the battery threshold
+lidawake threshold 25    # change your reserve (never below the hard floor)
+lidawake calibrate       # measure this machine, derive its hard floor
 lidawake blank off       # stop dimming the backlight on lid close
 lidawake lock  off       # stop locking the screen on lid close
 lidawake run -- CMD      # hold only while CMD runs, then restore
@@ -109,6 +110,69 @@ Touch ID tap.
 
 **`kDisp` in `pmset -g log` does not tell you whether the lid is shut.** Read
 `AppleClamshellState` from `ioreg` instead.
+
+## Where the battery threshold comes from
+
+The default is 20%. That number is not a safety limit, and it is worth being
+precise about why — because "20%" quietly bundles three unrelated concerns:
+
+- **A safety floor** — below this there is not enough runway to release the hold
+  and finish a clean sleep before the battery is empty. The only hard
+  constraint, and the only one that can be derived.
+- **A reserve** — how much charge you want left when you open the lid at your
+  destination. A preference, not a limit.
+- **Cell longevity** — repeated deep discharge ages lithium cells. Independent
+  of this tool.
+
+`lidawake calibrate` measures your machine and derives the first one:
+
+```
+Battery   : 4242 mAh full (design 4629 mAh, health 91%), 11224 mV
+Peak draw : 2242 mA on 10 cores = 25.2 W
+Sleep img : 4502 MB, disk 1525 MB/s
+
+Derivation
+  discharge at peak load     0.88 %/min
+  detect (poll interval)     10 s
+  write hibernate image      5.9 s  (2x margin)
+  + fixed overhead           5 s
+  --------------------------------
+  time to sleep safely       20.9 s
+  charge consumed in that    0.31 %
+  x safety factor            3
+  --------------------------------
+  derived from discharge     1 %
+  gauge-error clamp          5 % (not derived — see note)
+  ================================
+  HARD FLOOR                 5 %
+```
+
+The result is the interesting part: **shutting down safely costs about 1% of
+charge.** Whatever justifies a 20% default, it is not the risk of running out
+mid-sleep. Those other 19 points are reserve and cell longevity — both
+legitimate, neither a safety argument.
+
+The floor is clamped at 5%, and the clamp is honest about being a clamp: the
+arithmetic models discharge rate and shutdown time, but not state-of-charge
+gauge error, which is largest near empty and can be several points on an aged
+cell. A reported 2% may really be 0%.
+
+Your reserve is yours to set, and cannot be pushed below the floor:
+
+```bash
+lidawake threshold 10
+```
+
+Two limits of this derivation, stated plainly:
+
+- Peak draw depends on whatever else is running, so repeated calibrations
+  disagree. The floor only ratchets up — a quieter re-run will not erase a
+  worse case already observed.
+- We do not know whether macOS's own critical-battery hibernate still fires
+  while `SleepDisabled=1`. That flag has already been shown to disable display
+  sleep. If the failsafe is gone too, this threshold is the only line of
+  defence rather than a convenience. Untested, because testing it means running
+  a battery to zero.
 
 ## Verify it yourself
 

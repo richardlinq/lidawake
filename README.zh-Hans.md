@@ -67,7 +67,8 @@ lidawake toggle          # 在两种模式之间切换
 lidawake auto            # Keep Running
 lidawake normal          # Let It Sleep（出厂行为）
 
-lidawake threshold 25    # 改电量阈值
+lidawake threshold 25    # 改你的余量（不得低于硬底线）
+lidawake calibrate       # 测量这台机器，推导它的硬底线
 lidawake blank off       # 不要在合盖时压暗背光
 lidawake lock  off       # 不要在合盖时锁定屏幕
 lidawake run -- CMD      # 只在 CMD 执行期间保持，跑完自动恢复
@@ -99,6 +100,60 @@ lidawake run -- CMD      # 只在 CMD 执行期间保持，跑完自动恢复
 
 **`pmset -g log` 里的 `kDisp` 不能用来判断盖子有没有合上。**
 请改读 `ioreg` 的 `AppleClamshellState`。
+
+## 电量阈值这个数字是怎么来的
+
+默认值是 20%。**这不是一个安全数字**，而且值得把话讲清楚 —— 因为「20%」悄悄把三件性质完全不同的事绑在一起了：
+
+- **安全底线** —— 低于这个电量，就来不及松手并完成一次干净的休眠，电池会先耗尽。
+  这是唯一的硬约束，也是唯一可以推导出来的。
+- **抵达余量** —— 你到目的地打开盖子时希望还剩多少电。这是偏好，不是限制。
+- **电池寿命** —— 反复深度放电会加速锂电池老化。这跟这个工具无关。
+
+`lidawake calibrate` 会实际测量你这台机器，推导出第一项：
+
+```
+Battery   : 4242 mAh full (design 4629 mAh, health 91%), 11224 mV
+Peak draw : 2242 mA on 10 cores = 25.2 W
+Sleep img : 4502 MB, disk 1525 MB/s
+
+Derivation
+  discharge at peak load     0.88 %/min
+  detect (poll interval)     10 s
+  write hibernate image      5.9 s  (2x margin)
+  + fixed overhead           5 s
+  --------------------------------
+  time to sleep safely       20.9 s
+  charge consumed in that    0.31 %
+  x safety factor            3
+  --------------------------------
+  derived from discharge     1 %
+  gauge-error clamp          5 % (not derived — see note)
+  ================================
+  HARD FLOOR                 5 %
+```
+
+结果本身才是重点：**安全地睡下去只要花大约 1% 的电。** 不管 20% 这个默认值是靠什么撑起来的，
+反正不是「怕睡到一半没电」。剩下那 19 个百分点买的是抵达余量和电池寿命 ——
+两者都成立，但两者都不是安全论证。
+
+底线被夹在 5%，而且这个夹值老实承认自己就是个夹值：上面的算式只建模了掉电速度和关机耗时，
+**没有建模电量计本身的误差**，而电量计恰恰在接近空的时候最不准，老化的电池可能差好几个百分点。
+显示 2% 可能实际上是 0%。
+
+余量由你决定，但不能低于底线：
+
+```bash
+lidawake threshold 10
+```
+
+这套推导有两个限制，直说：
+
+- 峰值功耗取决于当下还有什么在跑，所以每次校准结果都不一样。底线只会往上走 ——
+  安静时重跑一次，不会洗掉先前观测到的更坏情况。
+- 我们不知道 `SleepDisabled=1` 的时候，macOS 自己那套「电量见底强制休眠」还有没有效。
+  这个标志已经被证实会停用屏幕休眠。如果连那道保险也一起没了，那这个阈值就是**唯一的防线**
+  而不是便利设计。没测过，因为要测就得把一颗电池放到 0。
 
 ## 自己验证，不要相信我
 

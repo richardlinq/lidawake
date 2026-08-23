@@ -67,7 +67,8 @@ lidawake toggle          # 在兩種模式之間切換
 lidawake auto            # Keep Running
 lidawake normal          # Let It Sleep（出廠行為）
 
-lidawake threshold 25    # 改電量門檻
+lidawake threshold 25    # 改你的餘量（不得低於硬底線）
+lidawake calibrate       # 量測這台機器，推導它的硬底線
 lidawake blank off       # 不要在蓋上時壓暗背光
 lidawake lock  off       # 不要在蓋上時鎖定螢幕
 lidawake run -- CMD      # 只在 CMD 執行期間撐住，跑完自動還原
@@ -99,6 +100,60 @@ lidawake run -- CMD      # 只在 CMD 執行期間撐住，跑完自動還原
 
 **`pmset -g log` 裡的 `kDisp` 不能用來判斷蓋子有沒有闔上。**
 請改讀 `ioreg` 的 `AppleClamshellState`。
+
+## 電量門檻這個數字是怎麼來的
+
+預設值是 20%。**這不是一個安全數字**，而且值得把話講清楚 —— 因為「20%」悄悄把三件性質完全不同的事綁在一起了：
+
+- **安全底線** —— 低於這個電量，就來不及放手並完成一次乾淨的休眠，電池會先耗盡。
+  這是唯一的硬約束，也是唯一可以推導出來的。
+- **抵達餘量** —— 你到目的地打開蓋子時希望還剩多少電。這是偏好，不是限制。
+- **電池壽命** —— 反覆深度放電會加速鋰電池老化。這跟這個工具無關。
+
+`lidawake calibrate` 會實際量測你這台機器，推導出第一項：
+
+```
+Battery   : 4242 mAh full (design 4629 mAh, health 91%), 11224 mV
+Peak draw : 2242 mA on 10 cores = 25.2 W
+Sleep img : 4502 MB, disk 1525 MB/s
+
+Derivation
+  discharge at peak load     0.88 %/min
+  detect (poll interval)     10 s
+  write hibernate image      5.9 s  (2x margin)
+  + fixed overhead           5 s
+  --------------------------------
+  time to sleep safely       20.9 s
+  charge consumed in that    0.31 %
+  x safety factor            3
+  --------------------------------
+  derived from discharge     1 %
+  gauge-error clamp          5 % (not derived — see note)
+  ================================
+  HARD FLOOR                 5 %
+```
+
+結果本身才是重點：**安全地睡下去只要花大約 1% 的電。** 不管 20% 這個預設值是靠什麼撐起來的，
+反正不是「怕睡到一半沒電」。剩下那 19 個百分點買的是抵達餘量和電池壽命 ——
+兩者都成立，但兩者都不是安全論證。
+
+底線被夾在 5%，而且這個夾值老實承認自己就是個夾值：上面的算式只模型化了掉電速度和關機耗時，
+**沒有模型化電量計本身的誤差**，而電量計恰恰在接近空的時候最不準，老化的電池可能差好幾個百分點。
+顯示 2% 可能實際上是 0%。
+
+餘量由你決定，但不能低於底線：
+
+```bash
+lidawake threshold 10
+```
+
+這套推導有兩個限制，直說：
+
+- 峰值功耗取決於當下還有什麼在跑，所以每次校準結果都不一樣。底線只會往上走 ——
+  安靜時重跑一次，不會洗掉先前觀測到的更壞情況。
+- 我們不知道 `SleepDisabled=1` 的時候，macOS 自己那套「電量見底強制休眠」還有沒有效。
+  這個旗標已經被證實會停用螢幕休眠。如果連那道保險也一起沒了，那這個門檻就是**唯一的防線**
+  而不是便利設計。沒測過，因為要測就得把一顆電池放到 0。
 
 ## 自己驗證，不要相信我
 
