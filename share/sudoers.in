@@ -1,0 +1,5 @@
+# lidawake — passwordless access to exactly three pmset invocations.
+# Nothing else about sudo changes. Installed to /etc/sudoers.d/lidawake.
+__USER__ ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1
+__USER__ ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0
+__USER__ ALL=(root) NOPASSWD: /usr/bin/pmset -g

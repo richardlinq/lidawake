@@ -1,0 +1,206 @@
+#!/bin/bash
+# lidawake — keep your MacBook working with the lid closed.
+#
+# The switch that matters is the kernel-level SleepDisabled flag
+# (`sudo pmset -a disablesleep 1`). `caffeinate` only blocks *idle* sleep;
+# it does not block clamshell sleep, which is a separate path.
+#
+# Keep Running policy:
+#   on AC power                  -> hold (battery level ignored)
+#   on battery, level >= threshold -> hold
+#   on battery, level <  threshold -> release, normal sleep returns
+# A background daemon maintains this. You never have to remember anything.
+#
+# Trade-off: with SleepDisabled=1 macOS also stops turning the display off
+# by itself (measured: both `pmset displaysleepnow` and the `displaysleep`
+# idle timer are inert in this state). So on lid close we dim the backlight
+# ourselves via `dispbright`, and optionally lock the screen.
+
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+set -u   # deliberately NOT pipefail: `cmd | grep -q` closes the pipe early,
+         # the producer takes SIGPIPE, and every boolean test silently inverts.
+
+LABEL="cc.openq.lidawake"
+STATE="$HOME/.local/state/lidawake"; mkdir -p "$STATE"
+MODEF="$STATE/mode"; THRF="$STATE/threshold"; LOG="$STATE/lidawake.log"
+BLANKF="$STATE/blank_on_shut"; SAVEB="$STATE/saved_brightness"; LOCKF="$STATE/lock_on_shut"
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+POLL=10
+
+BRIGHT="$(dirname "$SELF")/dispbright"
+[ -x "$BRIGHT" ] || BRIGHT="$(command -v dispbright 2>/dev/null || printf '%s' "$BRIGHT")"
+
+[ -f "$THRF" ]   || echo 20   > "$THRF"
+[ -f "$MODEF" ]  || echo auto > "$MODEF"
+[ -f "$BLANKF" ] || echo 1    > "$BLANKF"
+[ -f "$LOCKF" ]  || echo 1    > "$LOCKF"
+thr(){ cat "$THRF" 2>/dev/null || echo 20; }
+mode(){ cat "$MODEF" 2>/dev/null || echo auto; }
+blank_on(){ cat "$BLANKF" 2>/dev/null || echo 1; }
+lock_on(){ cat "$LOCKF" 2>/dev/null || echo 1; }
+# Locking is a pure UI state. It does not pause any computation.
+do_lock(){ /usr/bin/python3 -c 'import ctypes;ctypes.CDLL("/System/Library/PrivateFrameworks/login.framework/login").SACLockScreenImmediate()' >/dev/null 2>&1; }
+
+log(){ printf '%s  %s\n' "$(date '+%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+notify(){ osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1 || true; }
+
+is_on(){ [ "$(ioreg -c IOPMrootDomain -r -d 1 2>/dev/null | awk -F'= ' '/"SleepDisabled"/{print $2; exit}')" = "Yes" ]; }
+on_ac(){ case "$(pmset -g batt 2>/dev/null)" in *"'AC Power'"*) return 0;; *) return 1;; esac; }
+batt(){ pmset -g batt 2>/dev/null | grep -oE '[0-9]+%' | head -1 | tr -d '%'; }
+lid(){ [ "$(ioreg -c IOPMrootDomain -r -d 1 2>/dev/null | awk -F'= ' '/AppleClamshellState/{print $2; exit}')" = "Yes" ] && echo SHUT || echo OPEN; }
+
+dim_down(){
+  [ -x "$BRIGHT" ] || return 1
+  local b; b=$("$BRIGHT" 2>/dev/null); [ -z "$b" ] && return 1
+  printf '%s\n' "$b" > "$SAVEB"
+  local lk=""
+  if [ "$(lock_on)" = 1 ]; then do_lock; lk=", screen locked"; fi
+  "$BRIGHT" 0.0 >/dev/null 2>&1
+  log "lid shut -> brightness $b -> 0${lk}"
+}
+dim_restore(){
+  local b; b=$(cat "$SAVEB" 2>/dev/null); rm -f "$SAVEB"
+  [ -z "$b" ] && return 0
+  [ -x "$BRIGHT" ] && "$BRIGHT" "$b" >/dev/null 2>&1
+  log "${1:-restore} -> brightness back to $b"
+}
+
+sudo_ok(){ sudo -n /usr/bin/pmset -g >/dev/null 2>&1; }
+_hw(){ sudo -n /usr/bin/pmset -a disablesleep "$1" >/dev/null 2>&1; }
+need_sudo(){ sudo_ok || { echo "error: passwordless pmset rule missing. Run ./install.sh (see README)." >&2; exit 1; }; }
+ensure(){ # ensure <0|1> <reason> [quiet]  — acts only when the state differs
+  if [ "$1" = 1 ]; then is_on && return 0; _hw 1; log "-> holding ($2)"; [ "${3:-}" = quiet ] || notify "lidawake: holding" "$2"
+  else is_on || return 0; _hw 0; log "-> released ($2)"; [ "${3:-}" = quiet ] || notify "lidawake: released" "$2"; fi
+}
+
+should_hold(){   # echoes the reason to hold; empty string means do not hold
+  local b; b=$(batt)
+  if on_ac; then echo "on AC power"; return; fi
+  if [ -n "${b:-}" ] && [ "$b" -ge "$(thr)" ]; then echo "battery ${b}% (threshold $(thr)%)"; return; fi
+  echo ""
+}
+
+_daemon(){
+  log "daemon started (threshold $(thr)%)"
+  # Safety: lid open but a saved brightness lingers -> last restore never ran.
+  [ "$(lid)" = OPEN ] && [ -f "$SAVEB" ] && dim_restore "daemon startup recovery"
+  while :; do
+    case "$(mode)" in
+      paused) ensure 0 "manually paused" quiet ;;
+      forced) ensure 1 "forced on" quiet ;;
+      *)      local r; r=$(should_hold)
+              if [ -n "$r" ]; then ensure 1 "$r"; else ensure 0 "battery $(batt)% below threshold $(thr)%"; fi ;;
+    esac
+    if [ "$(blank_on)" = 1 ]; then
+      if [ "$(lid)" = SHUT ] && is_on; then
+        [ -f "$SAVEB" ] || dim_down
+      else
+        [ -f "$SAVEB" ] && dim_restore "lid opened or hold released"
+      fi
+    fi
+    # While dimmed, poll the lid every second so the restore feels instant.
+    # Otherwise idle at POLL seconds so we are not burning power ourselves.
+    if [ -f "$SAVEB" ]; then
+      local i=0
+      while [ "$i" -lt "$POLL" ]; do
+        if [ "$(lid)" = OPEN ]; then dim_restore "lid opened"; break; fi
+        i=$((i+1)); sleep 1
+      done
+    else
+      sleep "$POLL"
+    fi
+  done
+}
+
+daemon_running(){ case "$(launchctl list 2>/dev/null)" in *"$LABEL"*) return 0;; *) return 1;; esac; }
+
+install_daemon(){
+  mkdir -p "$(dirname "$PLIST")"
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array>
+    <string>$SELF</string><string>__daemon</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardErrorPath</key><string>$STATE/daemon.err</string>
+</dict></plist>
+EOF
+  launchctl unload "$PLIST" 2>/dev/null
+  launchctl load "$PLIST" 2>/dev/null
+}
+
+case "${1:-status}" in
+  auto|custom)
+    need_sudo; echo auto > "$MODEF"; install_daemon
+    echo "Keep Running enabled."
+    echo "  on AC -> hold; on battery >= $(thr)% -> hold; below -> release"
+    sleep 2; "$SELF" status ;;
+  on)
+    need_sudo; echo forced > "$MODEF"; daemon_running || install_daemon
+    ensure 1 "forced on"
+    echo "Forced on (battery level ignored). Back to automatic: lidawake auto" ;;
+  off|normal)
+    need_sudo; echo paused > "$MODEF"; ensure 0 "manually turned off"
+    echo "Let It Sleep — lid close sleeps, exactly like stock macOS."
+    echo "  Switch back with: lidawake auto" ;;
+  toggle)
+    if [ "$(mode)" = auto ]; then exec "$SELF" normal; else exec "$SELF" auto; fi ;;
+  lock)
+    case "${2:-}" in
+      on)  echo 1 > "$LOCKF"; echo "Lock on lid close: ON (unlock with Touch ID)" ;;
+      off) echo 0 > "$LOCKF"; echo "Lock on lid close: OFF" ;;
+      *)   echo "Lock on lid close: $([ "$(lock_on)" = 1 ] && echo ON || echo OFF)   (lidawake lock on|off)" ;;
+    esac ;;
+  blank)
+    case "${2:-}" in
+      on)  echo 1 > "$BLANKF"; echo "Dim backlight on lid close: ON" ;;
+      off) echo 0 > "$BLANKF"; [ -f "$SAVEB" ] && dim_restore "feature disabled"; echo "Dim backlight on lid close: OFF" ;;
+      *)   echo "Dim backlight on lid close: $([ "$(blank_on)" = 1 ] && echo ON || echo OFF)   (lidawake blank on|off)" ;;
+    esac ;;
+  threshold)
+    [ -n "${2:-}" ] && { echo "$2" > "$THRF"; echo "Battery threshold set to $2%"; } || echo "Battery threshold: $(thr)%" ;;
+  status|st)
+    m=$(mode)
+    printf 'State   : %s\n' "$(is_on && echo 'holding — lid close keeps running' || echo 'not holding — lid close sleeps')"
+    case "$m" in
+      auto)   desc="Keep Running — hold on AC, or on battery >= $(thr)%" ;;
+      paused) desc="Let It Sleep — stock macOS behaviour" ;;
+      forced) desc="Keep Running (forced) — hold regardless of battery" ;;
+      *)      desc="$m" ;;
+    esac
+    printf 'Mode    : %s\n' "$desc"
+    printf 'Power   : %s %s%%   Lid: %s   Brightness: %s\n' \
+      "$(on_ac && echo 'AC' || echo 'battery')" "$(batt)" "$(lid)" "$([ -x "$BRIGHT" ] && "$BRIGHT" || echo '?')"
+    printf 'On shut : dim=%s  lock=%s\n' \
+      "$([ "$(blank_on)" = 1 ] && echo on || echo off)" "$([ "$(lock_on)" = 1 ] && echo on || echo off)"
+    daemon_running && echo "Daemon  : running" || echo "Daemon  : not running (run: lidawake auto)" ;;
+  run)
+    shift; [ "${1:-}" = "--" ] && shift
+    [ $# -eq 0 ] && { echo "usage: lidawake run -- <command>" >&2; exit 2; }
+    pm=$(mode); echo forced > "$MODEF"; ensure 1 "run wrapper" quiet
+    "$@"; rc=$?
+    echo "$pm" > "$MODEF"; exit $rc ;;
+  __daemon) _daemon ;;
+  -h|--help|help|*) cat <<EOF
+lidawake — keep your MacBook working with the lid closed
+
+  Two modes, flip between them with toggle:
+
+  lidawake auto          Keep Running — hold on AC, or on battery >= $(thr)%
+  lidawake normal        Let It Sleep — stock macOS behaviour
+  lidawake toggle        switch between the two
+
+  lidawake on            force hold regardless of battery (temporary)
+  lidawake status        show current state
+  lidawake threshold 25  change the battery threshold
+  lidawake blank on|off  dim the backlight on lid close (default on)
+  lidawake lock  on|off  lock the screen on lid close (default on)
+  lidawake run -- CMD    hold only while CMD runs, then restore
+EOF
+  ;;
+esac

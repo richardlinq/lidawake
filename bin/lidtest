@@ -1,0 +1,78 @@
+#!/bin/bash
+# lidtest — prove (or disprove) that the machine keeps running with the lid shut.
+#
+# Three independent lines of evidence, because any one of them can lie:
+#   A. heartbeat  — a timestamp every 5s; a gap means the machine stopped
+#   B. sleep log  — macOS's own `pmset -g log` Sleep/Wake records
+#   C. lid state  — ioreg AppleClamshellState, so we KNOW the lid was really shut
+# Without C a green result is meaningless: it would only prove the machine does
+# not idle-sleep, which plain `caffeinate` already gives you.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+set -u
+STATE="$HOME/.local/state/lidawake"; mkdir -p "$STATE"
+BEAT="$STATE/lidtest.beat"; MARK="$STATE/lidtest.start"; PID="$STATE/lidtest.pid"
+IV=5
+lid(){ [ "$(ioreg -c IOPMrootDomain -r -d 1 2>/dev/null | awk -F'= ' '/AppleClamshellState/{print $2; exit}')" = "Yes" ] && echo SHUT || echo OPEN; }
+batt(){ pmset -g batt 2>/dev/null | grep -oE '[0-9]+%' | head -1 | tr -d '%'; }
+on_ac(){ case "$(pmset -g batt 2>/dev/null)" in *"'AC Power'"*) return 0;; *) return 1;; esac; }
+
+_heart(){ local n=0
+  while :; do n=$((n+1))
+    printf '%s|%s|%s|%s|%s|%s\n' "$(date +%s)" "$(date '+%H:%M:%S')" "$n" "$(batt)" "$(on_ac && echo AC || echo BATT)" "$(lid)" >> "$BEAT"
+    sleep "$IV"; done; }
+
+start(){
+  [ -f "$PID" ] && kill "$(cat "$PID")" 2>/dev/null
+  : > "$BEAT"; date '+%s|%Y-%m-%d %H:%M:%S' > "$MARK"
+  nohup "$0" __heart >/dev/null 2>&1 & echo $! > "$PID"; disown 2>/dev/null || true
+  sleep 6
+  echo "Heartbeat running (every ${IV}s)."
+  echo
+  echo "  1. Close the lid"
+  echo "  2. Wait ~2 minutes"
+  echo "  3. Open it, unlock"
+  echo "  4. Run:  lidtest report"
+}
+
+report(){
+  [ -f "$MARK" ] || { echo "No run in progress. Start with: lidtest start"; return 1; }
+  [ -f "$PID" ] && { kill "$(cat "$PID")" 2>/dev/null; rm -f "$PID"; }
+  local s_epoch s_human beats dur
+  s_epoch=$(cut -d'|' -f1 "$MARK"); s_human=$(cut -d'|' -f2 "$MARK")
+  beats=$(wc -l < "$BEAT" | tr -d ' '); dur=$(( $(date +%s) - s_epoch ))
+  echo "==== lidtest report ===="
+  echo "started $s_human   elapsed $((dur/60))m $((dur%60))s"
+  echo
+  echo "[A] heartbeat — $beats samples, ~$((dur/IV)) expected"
+  awk -F'|' -v iv="$IV" 'NR>1{d=$1-p; if(d>mx){mx=d; at=ph" -> "$2}} {p=$1; ph=$2}
+    END{ if(NR<2){print "    not enough data"; exit}
+      printf "    largest gap %ds (threshold %ds)%s\n", mx, iv*3, (mx>iv*3 ? "  at "at : "")
+      print (mx > iv*3) ? "    FAIL — the machine stopped" : "    PASS — ran continuously" }' "$BEAT"
+  echo
+  echo "[B] macOS sleep log"
+  local ev; ev=$(pmset -g log 2>/dev/null | awk -v s="$s_human" '/^[0-9]{4}-[0-9]{2}-[0-9]{2}/ && ($1" "$2) >= s && $4 ~ /^(Sleep|Wake|DarkWake)$/ {print "    "$0}')
+  if [ -z "$ev" ]; then echo "    no Sleep/Wake events recorded"; echo "    PASS — never slept"
+  else printf '%s\n' "$ev"; echo "    FAIL — see reasons above"; fi
+  echo
+  echo "[C] was the lid actually shut?"
+  local shut; shut=$(awk -F'|' '$6=="SHUT"' "$BEAT" | wc -l | tr -d ' ')
+  if [ "$shut" -eq 0 ]; then
+    echo "    never observed shut in $beats samples"
+    echo "    INVALID — you did not close the lid (or not long enough)"
+  else
+    local w; w=$(awk -F'|' '$6=="SHUT"{print $2}' "$BEAT")
+    printf '    shut for %d samples ~%ds (%s -> %s)\n' "$shut" "$((shut*IV))" "$(echo "$w"|head -1)" "$(echo "$w"|tail -1)"
+    echo "    PASS — lid confirmed shut"
+  fi
+  echo
+  echo "==== verdict ===="
+  local gap_ok=0; awk -F'|' -v iv="$IV" 'NR>1{d=$1-p;if(d>mx)mx=d}{p=$1}END{exit (mx>iv*3)}' "$BEAT" && gap_ok=1
+  if [ "$shut" -eq 0 ]; then echo "  INVALID — without a confirmed lid close this proves nothing."
+  elif [ "$gap_ok" -eq 1 ] && [ -z "$ev" ]; then echo "  PASS — lid shut ~$((shut*IV))s, machine never stopped."
+  else echo "  FAIL — it stopped. See [A] gap time and [B] sleep reason."; fi
+}
+
+case "${1:-}" in
+  start) start ;; report) report ;; __heart) _heart ;;
+  *) if [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; then report; else start; fi ;;
+esac
