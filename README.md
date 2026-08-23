@@ -1,5 +1,7 @@
 # lidawake
 
+**English** | [简体中文](README.zh-Hans.md) | [繁體中文](README.zh-Hant.md)
+
 Keep your MacBook working with the lid closed — screen dark, screen locked,
 everything still running. No external display, no dock, no power adapter required.
 
