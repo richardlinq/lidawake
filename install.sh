@@ -28,7 +28,10 @@ done
 case ":$PATH:" in *":$BINDIR:"*) : ;; *) printf '      NOTE: %s is not on your PATH — add it to your shell profile.\n' "$BINDIR" ;; esac
 
 say "4/5  Installing the sudoers rule (needs your password)"
-if sudo -n /usr/bin/pmset -g >/dev/null 2>&1; then
+# Test for the file, not for `sudo -n` success: sudo caches credentials for a
+# few minutes, so right after any other sudo command the -n probe succeeds even
+# when the rule is gone. That is exactly the uninstall-then-reinstall path.
+if [ -f "$SUDOERS" ]; then
   printf '      already in place, skipping\n'
 else
   tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT

@@ -80,9 +80,40 @@ dim_restore(){
 sudo_ok(){ sudo -n /usr/bin/pmset -g >/dev/null 2>&1; }
 _hw(){ sudo -n /usr/bin/pmset -a disablesleep "$1" >/dev/null 2>&1; }
 need_sudo(){ sudo_ok || { echo "error: passwordless pmset rule missing. Run ./install.sh (see README)." >&2; exit 1; }; }
+# Report a persistent fault, but at most once every 10 minutes: a broken
+# sudoers rule would otherwise log and notify on every single poll.
+_fail(){
+  local now last f="$STATE/last_fail"
+  now=$(date +%s); last=$(cat "$f" 2>/dev/null || echo 0)
+  if [ $((now - last)) -ge 600 ]; then
+    printf '%s\n' "$now" > "$f"
+    log "FAILED: $1"
+    notify "lidawake is not working" "$1" "Basso"
+  fi
+}
 ensure(){ # ensure <0|1> <reason> [quiet]  — acts only when the state differs
-  if [ "$1" = 1 ]; then is_on && return 0; _hw 1; log "-> holding ($2)"; [ "${3:-}" = quiet ] || notify "lidawake: holding" "$2"
-  else is_on || return 0; _hw 0; log "-> released ($2)"; [ "${3:-}" = quiet ] || notify "lidawake: released" "$2"; fi
+  # Never claim success from the exit code alone: re-read the kernel flag and
+  # confirm it actually moved. A missing sudoers rule makes `sudo -n` fail
+  # silently, and an unchecked call would happily log "holding" forever.
+  if [ "$1" = 1 ]; then
+    is_on && return 0
+    if _hw 1 && is_on; then
+      rm -f "$STATE/last_fail"; log "-> holding ($2)"
+      [ "${3:-}" = quiet ] || notify "lidawake: holding" "$2"
+    else
+      _fail "could not disable sleep — is /etc/sudoers.d/lidawake installed? Re-run ./install.sh"
+      return 1
+    fi
+  else
+    is_on || return 0
+    if _hw 0 && ! is_on; then
+      rm -f "$STATE/last_fail"; log "-> released ($2)"
+      [ "${3:-}" = quiet ] || notify "lidawake: released" "$2"
+    else
+      _fail "could not re-enable sleep — is /etc/sudoers.d/lidawake installed? Re-run ./install.sh"
+      return 1
+    fi
+  fi
 }
 
 should_hold(){   # echoes the reason to hold; empty string means do not hold
@@ -342,7 +373,13 @@ case "${1:-status}" in
       "$(on_ac && echo 'AC' || echo 'battery')" "$(batt)" "$(lid)" "$([ -x "$BRIGHT" ] && "$BRIGHT" || echo '?')"
     printf 'On shut : dim=%s  lock=%s\n' \
       "$([ "$(blank_on)" = 1 ] && echo on || echo off)" "$([ "$(lock_on)" = 1 ] && echo on || echo off)"
-    daemon_running && echo "Daemon  : running" || echo "Daemon  : not running (run: lidawake auto)" ;;
+    daemon_running && echo "Daemon  : running" || echo "Daemon  : not running (run: lidawake auto)"
+    m2=$(mode)
+    if { [ "$m2" = forced ] || { [ "$m2" = auto ] && [ -n "$(should_hold)" ]; }; } && ! is_on; then
+      echo
+      echo "PROBLEM : this mode should be holding, but the kernel flag is not set."
+      [ -f /etc/sudoers.d/lidawake ] || echo "          /etc/sudoers.d/lidawake is missing — re-run ./install.sh"
+    fi ;;
   run)
     shift; [ "${1:-}" = "--" ] && shift
     [ $# -eq 0 ] && { echo "usage: lidawake run -- <command>" >&2; exit 2; }
