@@ -24,7 +24,7 @@ LABEL="cc.openq.lidawake"
 STATE="$HOME/.local/state/lidawake"; mkdir -p "$STATE"
 MODEF="$STATE/mode"; THRF="$STATE/threshold"; LOG="$STATE/lidawake.log"
 BLANKF="$STATE/blank_on_shut"; SAVEB="$STATE/saved_brightness"; LOCKF="$STATE/lock_on_shut"
-FLOORF="$STATE/hard_floor"; CALF="$STATE/calibration.txt"
+FLOORF="$STATE/hard_floor"; CALF="$STATE/calibration.txt"; RUNF="$STATE/run_owner"
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 POLL=10
@@ -49,7 +49,12 @@ lock_on(){ cat "$LOCKF" 2>/dev/null || echo 1; }
 do_lock(){ /usr/bin/python3 -c 'import ctypes;ctypes.CDLL("/System/Library/PrivateFrameworks/login.framework/login").SACLockScreenImmediate()' >/dev/null 2>&1; }
 
 log(){ printf '%s  %s\n' "$(date '+%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
-notify(){ osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1 || true; }
+notify(){ # notify <title> <body> [sound]
+  local t b
+  t=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  b=$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  osascript -e "display notification \"$b\" with title \"$t\"${3:+ sound name \"$3\"}" >/dev/null 2>&1 || true
+}
 
 is_on(){ [ "$(ioreg -c IOPMrootDomain -r -d 1 2>/dev/null | awk -F'= ' '/"SleepDisabled"/{print $2; exit}')" = "Yes" ]; }
 on_ac(){ case "$(pmset -g batt 2>/dev/null)" in *"'AC Power'"*) return 0;; *) return 1;; esac; }
@@ -92,6 +97,16 @@ _daemon(){
   # Safety: lid open but a saved brightness lingers -> last restore never ran.
   [ "$(lid)" = OPEN ] && [ -f "$SAVEB" ] && dim_restore "daemon startup recovery"
   while :; do
+    # An abandoned `run` wrapper would otherwise pin the machine awake forever.
+    if [ "$(mode)" = forced ] && [ -f "$RUNF" ]; then
+      local owner prev
+      read -r owner prev < "$RUNF"
+      if [ -n "${owner:-}" ] && ! kill -0 "$owner" 2>/dev/null; then
+        rm -f "$RUNF"; echo "${prev:-auto}" > "$MODEF"
+        log "run wrapper (pid $owner) vanished -> mode restored to ${prev:-auto}"
+        notify "lidawake" "A run wrapper exited without cleaning up; mode restored to ${prev:-auto}"
+      fi
+    fi
     case "$(mode)" in
       paused) ensure 0 "manually paused" quiet ;;
       forced) ensure 1 "forced on" quiet ;;
@@ -331,9 +346,31 @@ case "${1:-status}" in
   run)
     shift; [ "${1:-}" = "--" ] && shift
     [ $# -eq 0 ] && { echo "usage: lidawake run -- <command>" >&2; exit 2; }
-    pm=$(mode); echo forced > "$MODEF"; ensure 1 "run wrapper" quiet
+    pm=$(mode); label=$(printf '%s' "$*" | cut -c1-48)
+    # Restore the previous mode even on Ctrl-C — otherwise an interrupted run
+    # leaves the machine pinned in `forced` forever.
+    # Two layers, because neither alone is enough:
+    #  - the trap is the fast path, but bash will not run it while blocked on a
+    #    foreground child, and it can never run under SIGKILL;
+    #  - the owner marker lets the daemon notice an abandoned `forced` mode and
+    #    put things back, whatever happened to this process.
+    trap 'rm -f "$RUNF"; echo "$pm" > "$MODEF"' EXIT INT TERM
+    printf '%s %s\n' "$$" "$pm" > "$RUNF"
+    echo forced > "$MODEF"; ensure 1 "run wrapper" quiet
+    t0=$(date +%s)
     "$@"; rc=$?
-    echo "$pm" > "$MODEF"; exit $rc ;;
+    el=$(( $(date +%s) - t0 ))
+    if   [ "$el" -ge 3600 ]; then dur="$((el/3600))h $(((el%3600)/60))m"
+    elif [ "$el" -ge 60 ];   then dur="$((el/60))m $((el%60))s"
+    else                          dur="${el}s"; fi
+    if [ "$rc" -eq 0 ]; then
+      log "run finished: $label (exit 0, $dur)"
+      notify "lidawake: finished" "$label — done in $dur" "Glass"
+    else
+      log "run FAILED: $label (exit $rc, $dur)"
+      notify "lidawake: FAILED (exit $rc)" "$label — after $dur" "Basso"
+    fi
+    exit $rc ;;
   __daemon) _daemon ;;
   -h|--help|help|*) cat <<EOF
 lidawake — keep your MacBook working with the lid closed
@@ -349,7 +386,7 @@ lidawake — keep your MacBook working with the lid closed
   lidawake threshold 25  change the battery threshold
   lidawake blank on|off  dim the backlight on lid close (default on)
   lidawake lock  on|off  lock the screen on lid close (default on)
-  lidawake run -- CMD    hold only while CMD runs, then restore
+  lidawake run -- CMD    hold only while CMD runs, then restore and notify
   lidawake calibrate     measure this machine and derive its hard floor
 EOF
   ;;

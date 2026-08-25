@@ -71,7 +71,7 @@ lidawake threshold 25    # 改你的余量（不得低于硬底线）
 lidawake calibrate       # 测量这台机器，推导它的硬底线
 lidawake blank off       # 不要在合盖时压暗背光
 lidawake lock  off       # 不要在合盖时锁定屏幕
-lidawake run -- CMD      # 只在 CMD 执行期间保持，跑完自动恢复
+lidawake run -- CMD      # 只在 CMD 执行期间保持，跑完自动恢复并通知你
 ```
 
 `raycast/` 里有四个 Raycast 命令，在 Raycast Settings → Script Commands 添加该目录即可。

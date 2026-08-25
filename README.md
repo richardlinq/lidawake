@@ -76,7 +76,7 @@ lidawake threshold 25    # change your reserve (never below the hard floor)
 lidawake calibrate       # measure this machine, derive its hard floor
 lidawake blank off       # stop dimming the backlight on lid close
 lidawake lock  off       # stop locking the screen on lid close
-lidawake run -- CMD      # hold only while CMD runs, then restore
+lidawake run -- CMD      # hold only while CMD runs, then restore and notify
 ```
 
 Optional Raycast commands live in `raycast/` — add that directory under
