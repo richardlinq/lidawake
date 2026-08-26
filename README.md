@@ -58,8 +58,12 @@ Two modes, one command to flip between them:
 ```bash
 git clone https://github.com/richardlinq/lidawake.git
 cd lidawake
+git checkout v0.1.0   # or stay on main for the newest, less settled, state
 ./install.sh
 ```
+
+See [CHANGELOG.md](CHANGELOG.md) for what each release changed and, more
+importantly, what is known to be wrong with it.
 
 The installer shows you the exact sudoers lines before asking for your
 password, and validates them with `visudo -c` before installing anything.

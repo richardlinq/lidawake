@@ -8,6 +8,7 @@ SUDOERS=/etc/sudoers.d/lidawake
 say(){ printf '\033[1m%s\033[0m\n' "$*"; }
 die(){ printf 'error: %s\n' "$*" >&2; exit 1; }
 
+say "lidawake $("$(cd "$(dirname "$0")" && pwd)/bin/lidawake" --version 2>/dev/null | awk '{print $2}')"
 say "1/5  Checking environment"
 [ "$(uname -s)" = Darwin ] || die "macOS only."
 command -v clang >/dev/null || die "clang not found. Install the Xcode Command Line Tools: xcode-select --install"

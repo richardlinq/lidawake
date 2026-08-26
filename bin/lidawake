@@ -20,6 +20,7 @@ export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 set -u   # deliberately NOT pipefail: `cmd | grep -q` closes the pipe early,
          # the producer takes SIGPIPE, and every boolean test silently inverts.
 
+VERSION="0.1.0"
 LABEL="cc.openq.lidawake"
 STATE="$HOME/.local/state/lidawake"; mkdir -p "$STATE"
 MODEF="$STATE/mode"; THRF="$STATE/threshold"; LOG="$STATE/lidawake.log"
@@ -361,6 +362,7 @@ case "${1:-status}" in
   calibrate) _calibrate ;;
   status|st)
     m=$(mode)
+    printf 'lidawake %s\n' "$VERSION"
     printf 'State   : %s\n' "$(is_on && echo 'holding — lid close keeps running' || echo 'not holding — lid close sleeps')"
     case "$m" in
       auto)   desc="Keep Running — hold on AC, or on battery >= $(thr)% (reserve $(cat "$THRF" 2>/dev/null||echo 20)%, floor $(floor)%)" ;;
@@ -408,6 +410,7 @@ case "${1:-status}" in
       notify "lidawake: FAILED (exit $rc)" "$label — after $dur" "Basso"
     fi
     exit $rc ;;
+  -v|--version|version) echo "lidawake $VERSION"; ;;
   __daemon) _daemon ;;
   -h|--help|help|*) cat <<EOF
 lidawake — keep your MacBook working with the lid closed
@@ -420,6 +423,7 @@ lidawake — keep your MacBook working with the lid closed
 
   lidawake on            force hold regardless of battery (temporary)
   lidawake status        show current state
+  lidawake --version     print the version
   lidawake threshold 25  change the battery threshold
   lidawake blank on|off  dim the backlight on lid close (default on)
   lidawake lock  on|off  lock the screen on lid close (default on)
